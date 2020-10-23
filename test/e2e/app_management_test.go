@@ -545,7 +545,9 @@ func TestConfigMap(t *testing.T) {
 }
 
 func TestFailedConversion(t *testing.T) {
-
+	if os.Getenv("ARGOCD_E2E_K3S") == "true" {
+		t.SkipNow()
+	}
 	defer func() {
 		FailOnErr(Run("", "kubectl", "delete", "apiservice", "v1beta1.metrics.k8s.io"))
 	}()
@@ -1183,7 +1185,7 @@ func TestSyncWithInfos(t *testing.T) {
 //Given: argocd app create does not provide --dest-namespace
 //       Manifest contains resource console which does not require namespace
 //Expect: no app.Status.Conditions
-func TestCreateAppWithNoNameSpaceForGlobalResourse(t *testing.T) {
+func TestCreateAppWithNoNameSpaceForGlobalResource(t *testing.T) {
 	Given(t).
 		Path(globalWithNoNameSpace).
 		When().
