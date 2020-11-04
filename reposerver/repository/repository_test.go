@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Masterminds/semver"
-	"github.com/argoproj/gitops-engine/pkg/utils/io"
 	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -32,6 +32,7 @@ import (
 	gitmocks "github.com/argoproj/argo-cd/util/git/mocks"
 	"github.com/argoproj/argo-cd/util/helm"
 	helmmocks "github.com/argoproj/argo-cd/util/helm/mocks"
+	"github.com/argoproj/argo-cd/util/io"
 )
 
 const testSignature = `gpg: Signature made Wed Feb 26 23:22:34 2020 CET
@@ -85,7 +86,7 @@ func newServiceWithOpt(cf clientFunc) (*Service, *gitmocks.Client) {
 	service.newGitClient = func(rawRepoURL string, creds git.Creds, insecure bool, enableLfs bool) (client git.Client, e error) {
 		return gitClient, nil
 	}
-	service.newHelmClient = func(repoURL string, creds helm.Creds) helm.Client {
+	service.newHelmClient = func(repoURL string, creds helm.Creds, enableOci bool) helm.Client {
 		return helmClient
 	}
 	return service, gitClient
@@ -132,7 +133,7 @@ func TestGenerateYamlManifestInDir(t *testing.T) {
 	q := apiclient.ManifestRequest{Repo: &argoappv1.Repository{}, ApplicationSource: &src}
 
 	// update this value if we add/remove manifests
-	const countOfManifests = 26
+	const countOfManifests = 29
 
 	res1, err := service.GenerateManifest(context.Background(), &q)
 
@@ -185,6 +186,17 @@ func TestRecurseManifestsInDir(t *testing.T) {
 	res1, err := service.GenerateManifest(context.Background(), &q)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(res1.Manifests))
+}
+
+func TestInvalidManifestsInDir(t *testing.T) {
+	service := newService(".")
+
+	src := argoappv1.ApplicationSource{Path: "./testdata/invalid-manifests", Directory: &argoappv1.ApplicationSourceDirectory{Recurse: true}}
+
+	q := apiclient.ManifestRequest{Repo: &argoappv1.Repository{}, ApplicationSource: &src}
+
+	_, err := service.GenerateManifest(context.Background(), &q)
+	assert.NotNil(t, err)
 }
 
 func TestGenerateJsonnetManifestInDir(t *testing.T) {
@@ -356,7 +368,9 @@ func TestManifestGenErrorCacheByNumRequests(t *testing.T) {
 					assert.True(t, cachedManifestResponse.FirstFailureTimestamp != 0)
 
 					// Internal cache values should update correctly based on number of return cache entries, consecutive failures should stay the same
+					// nolint:staticcheck
 					assert.True(t, cachedManifestResponse.NumberOfConsecutiveFailures == service.initConstants.PauseGenerationAfterFailedGenerationAttempts)
+					// nolint:staticcheck
 					assert.True(t, cachedManifestResponse.NumberOfCachedResponsesReturned == (adjustedInvocation-service.initConstants.PauseGenerationAfterFailedGenerationAttempts+1))
 				}
 			}
@@ -960,8 +974,9 @@ func TestGetRevisionMetadata(t *testing.T) {
 	}, nil)
 
 	res, err := service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
-		Repo:     &argoappv1.Repository{},
-		Revision: "c0b400fc458875d925171398f9ba9eabd5529923",
+		Repo:           &argoappv1.Repository{},
+		Revision:       "c0b400fc458875d925171398f9ba9eabd5529923",
+		CheckSignature: true,
 	})
 
 	assert.NoError(t, err)
@@ -969,7 +984,34 @@ func TestGetRevisionMetadata(t *testing.T) {
 	assert.Equal(t, now, res.Date.Time)
 	assert.Equal(t, "author", res.Author)
 	assert.EqualValues(t, []string{"tag1", "tag2"}, res.Tags)
+	assert.NotEmpty(t, res.SignatureInfo)
 
+	// Cache hit - signature info should not be in result
+	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
+		Repo:           &argoappv1.Repository{},
+		Revision:       "c0b400fc458875d925171398f9ba9eabd5529923",
+		CheckSignature: false,
+	})
+	assert.NoError(t, err)
+	assert.Empty(t, res.SignatureInfo)
+
+	// Enforce cache miss - signature info should not be in result
+	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
+		Repo:           &argoappv1.Repository{},
+		Revision:       "c0b400fc458875d925171398f9ba9eabd5529924",
+		CheckSignature: false,
+	})
+	assert.NoError(t, err)
+	assert.Empty(t, res.SignatureInfo)
+
+	// Cache hit on previous entry that did not have signature info
+	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
+		Repo:           &argoappv1.Repository{},
+		Revision:       "c0b400fc458875d925171398f9ba9eabd5529924",
+		CheckSignature: true,
+	})
+	assert.NoError(t, err)
+	assert.NotEmpty(t, res.SignatureInfo)
 }
 
 func TestGetSignatureVerificationResult(t *testing.T) {
@@ -1173,4 +1215,28 @@ func TestGenerateManifestWithAnnotatedAndRegularGitTagHashes(t *testing.T) {
 		})
 	}
 
+}
+
+func TestHelmDependencyWithConcurrency(t *testing.T) {
+	cleanup := func() {
+		_ = os.Remove(filepath.Join("../../util/helm/testdata/helm2-dependency", helmDepUpMarkerFile))
+		_ = os.RemoveAll(filepath.Join("../../util/helm/testdata/helm2-dependency", "charts"))
+	}
+	cleanup()
+	defer cleanup()
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	for i := 0; i < 3; i++ {
+		go func() {
+			res, err := helmTemplate("../../util/helm/testdata/helm2-dependency", "../..", nil, &apiclient.ManifestRequest{
+				ApplicationSource: &argoappv1.ApplicationSource{},
+			}, false)
+
+			assert.NoError(t, err)
+			assert.NotNil(t, res)
+			wg.Done()
+		}()
+	}
+	wg.Wait()
 }
