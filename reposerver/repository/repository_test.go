@@ -7,31 +7,32 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/Masterminds/semver"
 	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
-	argoappv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	"github.com/argoproj/argo-cd/reposerver/apiclient"
-	"github.com/argoproj/argo-cd/reposerver/cache"
-	"github.com/argoproj/argo-cd/reposerver/metrics"
-	fileutil "github.com/argoproj/argo-cd/test/fixture/path"
-	cacheutil "github.com/argoproj/argo-cd/util/cache"
-	"github.com/argoproj/argo-cd/util/git"
-	gitmocks "github.com/argoproj/argo-cd/util/git/mocks"
-	"github.com/argoproj/argo-cd/util/helm"
-	helmmocks "github.com/argoproj/argo-cd/util/helm/mocks"
-	"github.com/argoproj/argo-cd/util/io"
+	argoappv1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v2/reposerver/apiclient"
+	"github.com/argoproj/argo-cd/v2/reposerver/cache"
+	"github.com/argoproj/argo-cd/v2/reposerver/metrics"
+	fileutil "github.com/argoproj/argo-cd/v2/test/fixture/path"
+	cacheutil "github.com/argoproj/argo-cd/v2/util/cache"
+	"github.com/argoproj/argo-cd/v2/util/git"
+	gitmocks "github.com/argoproj/argo-cd/v2/util/git/mocks"
+	"github.com/argoproj/argo-cd/v2/util/helm"
+	helmmocks "github.com/argoproj/argo-cd/v2/util/helm/mocks"
+	"github.com/argoproj/argo-cd/v2/util/io"
 )
 
 const testSignature = `gpg: Signature made Wed Feb 26 23:22:34 2020 CET
@@ -48,7 +49,7 @@ func newServiceWithMocks(root string, signed bool) (*Service, *gitmocks.Client) 
 	}
 	return newServiceWithOpt(func(gitClient *gitmocks.Client) {
 		gitClient.On("Init").Return(nil)
-		gitClient.On("Fetch").Return(nil)
+		gitClient.On("Fetch", mock.Anything).Return(nil)
 		gitClient.On("Checkout", mock.Anything).Return(nil)
 		gitClient.On("LsRemote", mock.Anything).Return(mock.Anything, nil)
 		gitClient.On("CommitSHA").Return(mock.Anything, nil)
@@ -62,10 +63,6 @@ func newServiceWithMocks(root string, signed bool) (*Service, *gitmocks.Client) 
 }
 
 func newServiceWithOpt(cf clientFunc) (*Service, *gitmocks.Client) {
-	// root, err := filepath.Abs(root)
-	// if err != nil {
-	// 	panic(err)
-	// }
 	helmClient := &helmmocks.Client{}
 	gitClient := &gitmocks.Client{}
 	cf(gitClient)
@@ -75,9 +72,9 @@ func newServiceWithOpt(cf clientFunc) (*Service, *gitmocks.Client) {
 	), RepoServerInitConstants{ParallelismLimit: 1})
 
 	chart := "my-chart"
-	version := semver.MustParse("1.1.0")
-	helmClient.On("GetIndex").Return(&helm.Index{Entries: map[string]helm.Entries{
-		chart: {{Version: "1.0.0"}, {Version: version.String()}},
+	version := "1.1.0"
+	helmClient.On("GetIndex", true).Return(&helm.Index{Entries: map[string]helm.Entries{
+		chart: {{Version: "1.0.0"}, {Version: version}},
 	}}, nil)
 	helmClient.On("ExtractChart", chart, version).Return("./testdata/my-chart", io.NopCloser, nil)
 	helmClient.On("CleanChartCache", chart, version).Return(nil)
@@ -111,7 +108,7 @@ func newServiceWithCommitSHA(root, revision string) *Service {
 
 	service, gitClient := newServiceWithOpt(func(gitClient *gitmocks.Client) {
 		gitClient.On("Init").Return(nil)
-		gitClient.On("Fetch").Return(nil)
+		gitClient.On("Fetch", mock.Anything).Return(nil)
 		gitClient.On("Checkout", mock.Anything).Return(nil)
 		gitClient.On("LsRemote", revision).Return(revision, revisionErr)
 		gitClient.On("CommitSHA").Return("632039659e542ed7de0c170a4fcc1c571b288fc0", nil)
@@ -132,7 +129,7 @@ func TestGenerateYamlManifestInDir(t *testing.T) {
 	q := apiclient.ManifestRequest{Repo: &argoappv1.Repository{}, ApplicationSource: &src}
 
 	// update this value if we add/remove manifests
-	const countOfManifests = 29
+	const countOfManifests = 28
 
 	res1, err := service.GenerateManifest(context.Background(), &q)
 
@@ -269,7 +266,7 @@ func TestManifestGenErrorCacheByNumRequests(t *testing.T) {
 		assert.NotNil(t, manifestRequest)
 
 		cachedManifestResponse := &cache.CachedManifestResponse{}
-		err := service.cache.GetManifests(mock.Anything, manifestRequest.ApplicationSource, manifestRequest.Namespace, manifestRequest.AppLabelKey, manifestRequest.AppLabelValue, cachedManifestResponse)
+		err := service.cache.GetManifests(mock.Anything, manifestRequest.ApplicationSource, manifestRequest.Namespace, manifestRequest.AppLabelKey, manifestRequest.AppName, cachedManifestResponse)
 		assert.Nil(t, err)
 		return cachedManifestResponse
 	}
@@ -329,8 +326,8 @@ func TestManifestGenErrorCacheByNumRequests(t *testing.T) {
 				fmt.Printf("%d )-------------------------------------------\n", invocationCount)
 
 				manifestRequest := &apiclient.ManifestRequest{
-					Repo:          &argoappv1.Repository{},
-					AppLabelValue: "test",
+					Repo:    &argoappv1.Repository{},
+					AppName: "test",
 					ApplicationSource: &argoappv1.ApplicationSource{
 						Path: "./testdata/invalid-helm",
 					},
@@ -351,11 +348,11 @@ func TestManifestGenErrorCacheByNumRequests(t *testing.T) {
 
 				if adjustedInvocation < service.initConstants.PauseGenerationAfterFailedGenerationAttempts {
 					// GenerateManifest should not return cached errors for the first X responses, where X is the FailGenAttempts constants
-					assert.True(t, !isCachedError)
+					require.False(t, isCachedError)
 
-					assert.True(t, cachedManifestResponse != nil)
+					require.NotNil(t, cachedManifestResponse)
 					// nolint:staticcheck
-					assert.True(t, cachedManifestResponse.ManifestResponse == nil)
+					assert.Nil(t, cachedManifestResponse.ManifestResponse)
 					// nolint:staticcheck
 					assert.True(t, cachedManifestResponse.FirstFailureTimestamp != 0)
 
@@ -369,9 +366,9 @@ func TestManifestGenErrorCacheByNumRequests(t *testing.T) {
 					// GenerateManifest SHOULD return cached errors for the next X responses, where X is the
 					// PauseGenerationOnFailureForRequests constant
 					assert.True(t, isCachedError)
-					assert.True(t, cachedManifestResponse != nil)
+					require.NotNil(t, cachedManifestResponse)
 					// nolint:staticcheck
-					assert.True(t, cachedManifestResponse.ManifestResponse == nil)
+					assert.Nil(t, cachedManifestResponse.ManifestResponse)
 					// nolint:staticcheck
 					assert.True(t, cachedManifestResponse.FirstFailureTimestamp != 0)
 
@@ -426,8 +423,8 @@ func TestManifestGenErrorCacheFileContentsChange(t *testing.T) {
 		}
 
 		res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-			Repo:          &argoappv1.Repository{},
-			AppLabelValue: "test",
+			Repo:    &argoappv1.Repository{},
+			AppName: "test",
 			ApplicationSource: &argoappv1.ApplicationSource{
 				Path: ".",
 			},
@@ -478,8 +475,8 @@ func TestManifestGenErrorCacheByMinutesElapsed(t *testing.T) {
 			// 1) Put the cache into the failure state
 			for x := 0; x < 2; x++ {
 				res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-					Repo:          &argoappv1.Repository{},
-					AppLabelValue: "test",
+					Repo:    &argoappv1.Repository{},
+					AppName: "test",
 					ApplicationSource: &argoappv1.ApplicationSource{
 						Path: "./testdata/invalid-helm",
 					},
@@ -497,8 +494,8 @@ func TestManifestGenErrorCacheByMinutesElapsed(t *testing.T) {
 			// 2) Jump forward X-1 minutes in time, where X is the expiration boundary
 			currentTime = currentTime.Add(time.Duration(tt.PauseGenerationOnFailureForMinutes-1) * time.Minute)
 			res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-				Repo:          &argoappv1.Repository{},
-				AppLabelValue: "test",
+				Repo:    &argoappv1.Repository{},
+				AppName: "test",
 				ApplicationSource: &argoappv1.ApplicationSource{
 					Path: "./testdata/invalid-helm",
 				},
@@ -512,8 +509,8 @@ func TestManifestGenErrorCacheByMinutesElapsed(t *testing.T) {
 			currentTime = currentTime.Add(2 * time.Minute)
 
 			res, err = service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-				Repo:          &argoappv1.Repository{},
-				AppLabelValue: "test",
+				Repo:    &argoappv1.Repository{},
+				AppName: "test",
 				ApplicationSource: &argoappv1.ApplicationSource{
 					Path: "./testdata/invalid-helm",
 				},
@@ -542,8 +539,8 @@ func TestManifestGenErrorCacheRespectsNoCache(t *testing.T) {
 	// 1) Put the cache into the failure state
 	for x := 0; x < 2; x++ {
 		res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-			Repo:          &argoappv1.Repository{},
-			AppLabelValue: "test",
+			Repo:    &argoappv1.Repository{},
+			AppName: "test",
 			ApplicationSource: &argoappv1.ApplicationSource{
 				Path: "./testdata/invalid-helm",
 			},
@@ -559,8 +556,8 @@ func TestManifestGenErrorCacheRespectsNoCache(t *testing.T) {
 
 	// 2) Call generateManifest with NoCache enabled
 	res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./testdata/invalid-helm",
 		},
@@ -573,8 +570,8 @@ func TestManifestGenErrorCacheRespectsNoCache(t *testing.T) {
 
 	// 4) Call generateManifest
 	res, err = service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./testdata/invalid-helm",
 		},
@@ -590,8 +587,8 @@ func TestGenerateHelmWithValues(t *testing.T) {
 	service := newService("../..")
 
 	res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -626,8 +623,8 @@ func TestGenerateHelmWithValues(t *testing.T) {
 func TestGenerateHelmWithValuesDirectoryTraversal(t *testing.T) {
 	service := newService("../..")
 	_, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -641,8 +638,8 @@ func TestGenerateHelmWithValuesDirectoryTraversal(t *testing.T) {
 	// Test the case where the path is "."
 	service = newService("./testdata/my-chart")
 	_, err = service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: ".",
 		},
@@ -694,8 +691,8 @@ func TestGenerateHelmWithURL(t *testing.T) {
 	service := newService("../..")
 
 	_, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -712,8 +709,8 @@ func TestGenerateHelmWithURL(t *testing.T) {
 func TestGenerateHelmWithValuesDirectoryTraversalOutsideRepo(t *testing.T) {
 	service := newService("../..")
 	_, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -726,8 +723,8 @@ func TestGenerateHelmWithValuesDirectoryTraversalOutsideRepo(t *testing.T) {
 
 	service = newService("./testdata/my-chart")
 	_, err = service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: ".",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -753,10 +750,11 @@ func TestGenerateHelmWithAbsoluteFileParameter(t *testing.T) {
 	assert.NoError(t, err)
 	err = ioutil.WriteFile(externalSecretPath, expectedFileContent, 0644)
 	assert.NoError(t, err)
+	defer file.Close()
 
 	_, err = service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -782,8 +780,8 @@ func TestGenerateHelmWithFileParameter(t *testing.T) {
 	service := newService("../..")
 
 	_, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo:          &argoappv1.Repository{},
-		AppLabelValue: "test",
+		Repo:    &argoappv1.Repository{},
+		AppName: "test",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path: "./util/helm/testdata/redis",
 			Helm: &argoappv1.ApplicationSourceHelm{
@@ -829,15 +827,15 @@ func TestGenerateNullList(t *testing.T) {
 }
 
 func TestIdentifyAppSourceTypeByAppDirWithKustomizations(t *testing.T) {
-	sourceType, err := GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/kustomization_yaml")
+	sourceType, err := GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/kustomization_yaml", "testapp")
 	assert.Nil(t, err)
 	assert.Equal(t, argoappv1.ApplicationSourceTypeKustomize, sourceType)
 
-	sourceType, err = GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/kustomization_yml")
+	sourceType, err = GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/kustomization_yml", "testapp")
 	assert.Nil(t, err)
 	assert.Equal(t, argoappv1.ApplicationSourceTypeKustomize, sourceType)
 
-	sourceType, err = GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/Kustomization")
+	sourceType, err = GetAppSourceType(&argoappv1.ApplicationSource{}, "./testdata/Kustomization", "testapp")
 	assert.Nil(t, err)
 	assert.Equal(t, argoappv1.ApplicationSourceTypeKustomize, sourceType)
 }
@@ -846,8 +844,8 @@ func TestRunCustomTool(t *testing.T) {
 	service := newService(".")
 
 	res, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		AppLabelValue: "test-app",
-		Namespace:     "test-namespace",
+		AppName:   "test-app",
+		Namespace: "test-namespace",
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Plugin: &argoappv1.ApplicationSourcePlugin{
 				Name: "test",
@@ -895,14 +893,16 @@ func TestListApps(t *testing.T) {
 	assert.NoError(t, err)
 
 	expectedApps := map[string]string{
-		"Kustomization":      "Kustomize",
-		"app-parameters":     "Kustomize",
-		"invalid-helm":       "Helm",
-		"invalid-kustomize":  "Kustomize",
-		"kustomization_yaml": "Kustomize",
-		"kustomization_yml":  "Kustomize",
-		"my-chart":           "Helm",
-		"my-chart-2":         "Helm",
+		"Kustomization":                  "Kustomize",
+		"app-parameters/multi":           "Kustomize",
+		"app-parameters/single-app-only": "Kustomize",
+		"app-parameters/single-global":   "Kustomize",
+		"invalid-helm":                   "Helm",
+		"invalid-kustomize":              "Kustomize",
+		"kustomization_yaml":             "Kustomize",
+		"kustomization_yml":              "Kustomize",
+		"my-chart":                       "Helm",
+		"my-chart-2":                     "Helm",
 	}
 	assert.Equal(t, expectedApps, res.Apps)
 }
@@ -975,7 +975,7 @@ func TestGetRevisionMetadata(t *testing.T) {
 	now := time.Now()
 
 	gitClient.On("RevisionMetadata", mock.Anything).Return(&git.RevisionMetadata{
-		Message: strings.Repeat("a", 100) + "\n" + "second line",
+		Message: "test",
 		Author:  "author",
 		Date:    now,
 		Tags:    []string{"tag1", "tag2"},
@@ -988,7 +988,21 @@ func TestGetRevisionMetadata(t *testing.T) {
 	})
 
 	assert.NoError(t, err)
-	assert.Equal(t, strings.Repeat("a", 61)+"...", res.Message)
+	assert.Equal(t, "test", res.Message)
+	assert.Equal(t, now, res.Date.Time)
+	assert.Equal(t, "author", res.Author)
+	assert.EqualValues(t, []string{"tag1", "tag2"}, res.Tags)
+	assert.NotEmpty(t, res.SignatureInfo)
+
+	// Check for truncated revision value
+	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
+		Repo:           &argoappv1.Repository{},
+		Revision:       "c0b400f",
+		CheckSignature: true,
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "test", res.Message)
 	assert.Equal(t, now, res.Date.Time)
 	assert.Equal(t, "author", res.Author)
 	assert.EqualValues(t, []string{"tag1", "tag2"}, res.Tags)
@@ -1006,7 +1020,7 @@ func TestGetRevisionMetadata(t *testing.T) {
 	// Enforce cache miss - signature info should not be in result
 	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
 		Repo:           &argoappv1.Repository{},
-		Revision:       "c0b400fc458875d925171398f9ba9eabd5529924",
+		Revision:       "da52afd3b2df1ec49470603d8bbb46954dab1091",
 		CheckSignature: false,
 	})
 	assert.NoError(t, err)
@@ -1015,7 +1029,7 @@ func TestGetRevisionMetadata(t *testing.T) {
 	// Cache hit on previous entry that did not have signature info
 	res, err = service.GetRevisionMetadata(context.Background(), &apiclient.RepoServerRevisionMetadataRequest{
 		Repo:           &argoappv1.Repository{},
-		Revision:       "c0b400fc458875d925171398f9ba9eabd5529924",
+		Revision:       "da52afd3b2df1ec49470603d8bbb46954dab1091",
 		CheckSignature: true,
 	})
 	assert.NoError(t, err)
@@ -1078,9 +1092,9 @@ func Test_newEnv(t *testing.T) {
 		&argoappv1.EnvEntry{Name: "ARGOCD_APP_SOURCE_PATH", Value: "my-path"},
 		&argoappv1.EnvEntry{Name: "ARGOCD_APP_SOURCE_TARGET_REVISION", Value: "my-target-revision"},
 	}, newEnv(&apiclient.ManifestRequest{
-		AppLabelValue: "my-app-name",
-		Namespace:     "my-namespace",
-		Repo:          &argoappv1.Repository{Repo: "https://github.com/my-org/my-repo"},
+		AppName:   "my-app-name",
+		Namespace: "my-namespace",
+		Repo:      &argoappv1.Repository{Repo: "https://github.com/my-org/my-repo"},
 		ApplicationSource: &argoappv1.ApplicationSource{
 			Path:           "my-path",
 			TargetRevision: "my-target-revision",
@@ -1092,62 +1106,215 @@ func TestService_newHelmClientResolveRevision(t *testing.T) {
 	service := newService(".")
 
 	t.Run("EmptyRevision", func(t *testing.T) {
-		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "", "")
+		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "", "", true)
 		assert.EqualError(t, err, "invalid revision '': improper constraint: ")
 	})
 	t.Run("InvalidRevision", func(t *testing.T) {
-		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "???", "")
-		assert.EqualError(t, err, "invalid revision '???': improper constraint: ???")
+		_, _, err := service.newHelmClientResolveRevision(&argoappv1.Repository{}, "???", "", true)
+		assert.EqualError(t, err, "invalid revision '???': improper constraint: ???", true)
 	})
 }
 
 func TestGetAppDetailsWithAppParameterFile(t *testing.T) {
-	service := newService(".")
-	details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
-		Repo: &argoappv1.Repository{},
-		Source: &argoappv1.ApplicationSource{
-			Path: "./testdata/app-parameters",
-		},
+	t.Run("No app name set and app specific file exists", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "multi", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+			})
+			require.NoError(t, err)
+			assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.2"}, details.Kustomize.Images)
+		})
 	})
-	if !assert.NoError(t, err) {
-		return
+	t.Run("No app specific override", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "single-global", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "testapp",
+			})
+			require.NoError(t, err)
+			assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.2"}, details.Kustomize.Images)
+		})
+	})
+	t.Run("Only app specific override", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "single-app-only", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "testapp",
+			})
+			require.NoError(t, err)
+			assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.3"}, details.Kustomize.Images)
+		})
+	})
+	t.Run("App specific override", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "multi", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "testapp",
+			})
+			require.NoError(t, err)
+			assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.3"}, details.Kustomize.Images)
+		})
+	})
+	t.Run("App specific overrides containing non-mergeable field", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "multi", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "unmergeable",
+			})
+			require.NoError(t, err)
+			assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.3"}, details.Kustomize.Images)
+		})
+	})
+	t.Run("Broken app-specific overrides", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "multi", func(t *testing.T, path string) {
+			details, err := service.GetAppDetails(context.Background(), &apiclient.RepoServerAppDetailsQuery{
+				Repo: &argoappv1.Repository{},
+				Source: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "broken",
+			})
+			assert.Error(t, err)
+			assert.Nil(t, details)
+		})
+	})
+}
+
+// There are unit test that will use kustomize set and by that modify the
+// kustomization.yaml. For proper testing, we need to copy the testdata to a
+// temporary path, run the tests, and then throw the copy away again.
+func mkTempParameters(source string) string {
+	tempDir, err := ioutil.TempDir("./testdata", "app-parameters")
+	if err != nil {
+		panic(err)
 	}
-	assert.EqualValues(t, []string{"gcr.io/heptio-images/ks-guestbook-demo:0.2"}, details.Kustomize.Images)
+	cmd := exec.Command("cp", "-R", source, tempDir)
+	err = cmd.Run()
+	if err != nil {
+		os.RemoveAll(tempDir)
+		panic(err)
+	}
+	return tempDir
+}
+
+// Simple wrapper run a test with a temporary copy of the testdata, because
+// the test would modify the data when run.
+func runWithTempTestdata(t *testing.T, path string, runner func(t *testing.T, path string)) {
+	tempDir := mkTempParameters("./testdata/app-parameters")
+	defer os.RemoveAll(tempDir)
+	runner(t, filepath.Join(tempDir, "app-parameters", path))
 }
 
 func TestGenerateManifestsWithAppParameterFile(t *testing.T) {
-	service := newService(".")
-	manifests, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
-		Repo: &argoappv1.Repository{},
-		ApplicationSource: &argoappv1.ApplicationSource{
-			Path: "./testdata/app-parameters",
-		},
+	t.Run("Single global override", func(t *testing.T) {
+		runWithTempTestdata(t, "single-global", func(t *testing.T, path string) {
+			service := newService(".")
+			manifests, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
+				Repo: &argoappv1.Repository{},
+				ApplicationSource: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+			})
+			require.NoError(t, err)
+			resourceByKindName := make(map[string]*unstructured.Unstructured)
+			for _, manifest := range manifests.Manifests {
+				var un unstructured.Unstructured
+				err := yaml.Unmarshal([]byte(manifest), &un)
+				if !assert.NoError(t, err) {
+					return
+				}
+				resourceByKindName[fmt.Sprintf("%s/%s", un.GetKind(), un.GetName())] = &un
+			}
+			deployment, ok := resourceByKindName["Deployment/guestbook-ui"]
+			require.True(t, ok)
+			containers, ok, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+			require.True(t, ok)
+			image, ok, _ := unstructured.NestedString(containers[0].(map[string]interface{}), "image")
+			require.True(t, ok)
+			assert.Equal(t, "gcr.io/heptio-images/ks-guestbook-demo:0.2", image)
+		})
 	})
-	if !assert.NoError(t, err) {
-		return
-	}
-	resourceByKindName := make(map[string]*unstructured.Unstructured)
-	for _, manifest := range manifests.Manifests {
-		var un unstructured.Unstructured
-		err := yaml.Unmarshal([]byte(manifest), &un)
-		if !assert.NoError(t, err) {
-			return
-		}
-		resourceByKindName[fmt.Sprintf("%s/%s", un.GetKind(), un.GetName())] = &un
-	}
-	deployment, ok := resourceByKindName["Deployment/guestbook-ui"]
-	if !assert.True(t, ok) {
-		return
-	}
-	containers, ok, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
-	if !assert.True(t, ok) {
-		return
-	}
-	image, ok, _ := unstructured.NestedString(containers[0].(map[string]interface{}), "image")
-	if !assert.True(t, ok) {
-		return
-	}
-	assert.Equal(t, "gcr.io/heptio-images/ks-guestbook-demo:0.2", image)
+
+	t.Run("Application specific override", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "single-app-only", func(t *testing.T, path string) {
+			manifests, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
+				Repo: &argoappv1.Repository{},
+				ApplicationSource: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "testapp",
+			})
+			require.NoError(t, err)
+			resourceByKindName := make(map[string]*unstructured.Unstructured)
+			for _, manifest := range manifests.Manifests {
+				var un unstructured.Unstructured
+				err := yaml.Unmarshal([]byte(manifest), &un)
+				if !assert.NoError(t, err) {
+					return
+				}
+				resourceByKindName[fmt.Sprintf("%s/%s", un.GetKind(), un.GetName())] = &un
+			}
+			deployment, ok := resourceByKindName["Deployment/guestbook-ui"]
+			require.True(t, ok)
+			containers, ok, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+			require.True(t, ok)
+			image, ok, _ := unstructured.NestedString(containers[0].(map[string]interface{}), "image")
+			require.True(t, ok)
+			assert.Equal(t, "gcr.io/heptio-images/ks-guestbook-demo:0.3", image)
+		})
+	})
+
+	t.Run("Application specific override for other app", func(t *testing.T) {
+		service := newService(".")
+		runWithTempTestdata(t, "single-app-only", func(t *testing.T, path string) {
+			manifests, err := service.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
+				Repo: &argoappv1.Repository{},
+				ApplicationSource: &argoappv1.ApplicationSource{
+					Path: path,
+				},
+				AppName: "testapp2",
+			})
+			require.NoError(t, err)
+			resourceByKindName := make(map[string]*unstructured.Unstructured)
+			for _, manifest := range manifests.Manifests {
+				var un unstructured.Unstructured
+				err := yaml.Unmarshal([]byte(manifest), &un)
+				if !assert.NoError(t, err) {
+					return
+				}
+				resourceByKindName[fmt.Sprintf("%s/%s", un.GetKind(), un.GetName())] = &un
+			}
+			deployment, ok := resourceByKindName["Deployment/guestbook-ui"]
+			require.True(t, ok)
+			containers, ok, _ := unstructured.NestedSlice(deployment.Object, "spec", "template", "spec", "containers")
+			require.True(t, ok)
+			image, ok, _ := unstructured.NestedString(containers[0].(map[string]interface{}), "image")
+			require.True(t, ok)
+			assert.Equal(t, "gcr.io/heptio-images/ks-guestbook-demo:0.1", image)
+		})
+	})
 }
 
 func TestGenerateManifestWithAnnotatedAndRegularGitTagHashes(t *testing.T) {
@@ -1222,5 +1389,106 @@ func TestGenerateManifestWithAnnotatedAndRegularGitTagHashes(t *testing.T) {
 
 		})
 	}
+}
 
+func TestFindResources(t *testing.T) {
+	testCases := []struct {
+		name          string
+		include       string
+		exclude       string
+		expectedNames []string
+	}{{
+		name:          "Include One Match",
+		include:       "subdir/deploymentSub.yaml",
+		expectedNames: []string{"nginx-deployment-sub"},
+	}, {
+		name:          "Include Everything",
+		include:       "*.yaml",
+		expectedNames: []string{"nginx-deployment", "nginx-deployment-sub"},
+	}, {
+		name:          "Include Subdirectory",
+		include:       "**/*.yaml",
+		expectedNames: []string{"nginx-deployment-sub"},
+	}, {
+		name:          "Include No Matches",
+		include:       "nothing.yaml",
+		expectedNames: []string{},
+	}, {
+		name:          "Exclude - One Match",
+		exclude:       "subdir/deploymentSub.yaml",
+		expectedNames: []string{"nginx-deployment"},
+	}, {
+		name:          "Exclude - Everything",
+		exclude:       "*.yaml",
+		expectedNames: []string{},
+	}}
+	for i := range testCases {
+		tc := testCases[i]
+		t.Run(tc.name, func(t *testing.T) {
+			objs, err := findManifests("testdata/app-include-exclude", ".", nil, argoappv1.ApplicationSourceDirectory{
+				Recurse: true,
+				Include: tc.include,
+				Exclude: tc.exclude,
+			})
+			if !assert.NoError(t, err) {
+				return
+			}
+			var names []string
+			for i := range objs {
+				names = append(names, objs[i].GetName())
+			}
+			assert.ElementsMatch(t, tc.expectedNames, names)
+		})
+	}
+}
+
+func TestFindManifests_Exclude(t *testing.T) {
+	objs, err := findManifests("testdata/app-include-exclude", ".", nil, argoappv1.ApplicationSourceDirectory{
+		Recurse: true,
+		Exclude: "subdir/deploymentSub.yaml",
+	})
+
+	if !assert.NoError(t, err) || !assert.Len(t, objs, 1) {
+		return
+	}
+
+	assert.Equal(t, "nginx-deployment", objs[0].GetName())
+}
+
+func TestFindManifests_Exclude_NothingMatches(t *testing.T) {
+	objs, err := findManifests("testdata/app-include-exclude", ".", nil, argoappv1.ApplicationSourceDirectory{
+		Recurse: true,
+		Exclude: "nothing.yaml",
+	})
+
+	if !assert.NoError(t, err) || !assert.Len(t, objs, 2) {
+		return
+	}
+
+	assert.ElementsMatch(t,
+		[]string{"nginx-deployment", "nginx-deployment-sub"}, []string{objs[0].GetName(), objs[1].GetName()})
+}
+
+func TestTestRepoOCI(t *testing.T) {
+	service := newService(".")
+	_, err := service.TestRepository(context.Background(), &apiclient.TestRepositoryRequest{
+		Repo: &argoappv1.Repository{
+			Repo:      "https://demo.goharbor.io",
+			Type:      "helm",
+			EnableOCI: true,
+		},
+	})
+	assert.Error(t, err)
+	assert.Equal(t, "OCI Helm repository URL should include hostname and port only", err.Error())
+}
+
+func Test_getHelmDependencyRepos(t *testing.T) {
+	repo1 := "https://charts.bitnami.com/bitnami"
+	repo2 := "https://eventstore.github.io/EventStore.Charts"
+
+	repos, err := getHelmDependencyRepos("../../util/helm/testdata/dependency")
+	assert.NoError(t, err)
+	assert.Equal(t, len(repos), 2)
+	assert.Equal(t, repos[0].Repo, repo1)
+	assert.Equal(t, repos[1].Repo, repo2)
 }

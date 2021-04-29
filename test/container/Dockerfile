@@ -1,13 +1,15 @@
-FROM redis:5.0.10 as redis
+FROM redis:6.2.1 as redis
 
 FROM node:12.18.4 as node
 
-FROM golang:1.14.12 as golang
+FROM golang:1.16.0 as golang
 
-FROM debian:10-slim
+FROM registry:2.7.1 as registry
 
-RUN echo 'deb http://deb.debian.org/debian buster-backports main' >> /etc/apt/sources.list && \
-    apt-get update && apt-get install -y \
+FROM ubuntu:20.10
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN  apt-get update && apt-get install --fix-missing -y \
         ca-certificates \
         curl \
         openssh-server \
@@ -37,10 +39,10 @@ ADD ./hack/installers installers
 
 RUN ./install.sh dep-linux && \
     ./install.sh packr-linux && \
-    ./install.sh kubectl-linux && \
     ./install.sh ksonnet-linux && \
     ./install.sh helm2-linux && \
     ./install.sh helm-linux && \
+    ./install.sh kubectl-linux && \
     ./install.sh kustomize-linux && \
     ./install.sh codegen-tools && \
     ./install.sh codegen-go-tools && \
@@ -62,6 +64,10 @@ COPY ./test/fixture/testrepos/ssh_host_*_key* /etc/ssh/
 
 # Copy redis binaries to the image
 COPY --from=redis /usr/local/bin/* /usr/local/bin/
+
+# Copy registry binaries to the image
+COPY --from=registry /bin/registry /usr/local/bin/
+COPY --from=registry /etc/docker/registry/config.yml /etc/docker/registry/config.yml
 
 # Copy node binaries
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules

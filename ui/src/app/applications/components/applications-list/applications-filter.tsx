@@ -33,7 +33,7 @@ class ItemsFilter extends React.Component<
 
     public render() {
         const unavailableSelected = this.props.selected.filter(selected => !this.props.items.some(item => item.name === selected));
-        const items = this.props.items.sort((first, second) => second.count - first.count).concat(unavailableSelected.map(selected => ({name: selected, count: 0})));
+        const items = this.props.items.sort((first, second) => (first.name > second.name ? 1 : -1)).concat(unavailableSelected.map(selected => ({name: selected, count: 0})));
         return (
             <React.Fragment>
                 <ul className={classNames('applications-list__filter', {'applications-list__filter--expanded': this.state.expanded})}>
@@ -109,7 +109,13 @@ export class ApplicationsFilter extends React.Component<ApplicationsFilterProps,
         const filtersCount = AppsListPreferences.countEnabledFilters(pref);
 
         return (
-            <div className={classNames('applications-list__filters-container', {'applications-list__filters-container--expanded': this.state.expanded})}>
+            <div
+                className={classNames('applications-list__filters-container', {'applications-list__filters-container--expanded': this.state.expanded})}
+                onClick={() => {
+                    if (window.innerWidth < 1440) {
+                        this.setState({expanded: !this.state.expanded});
+                    }
+                }}>
                 <div className={classNames('applications-list__filters-title', {'applications-list__filters-title--expanded': this.state.expanded})}>
                     <Tooltip content='Filters'>
                         <i className='fa fa-filter' />

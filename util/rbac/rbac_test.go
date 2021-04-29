@@ -6,14 +6,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go/v4"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/argoproj/argo-cd/util/assets"
+	"github.com/argoproj/argo-cd/v2/util/assets"
 )
 
 const (
@@ -318,19 +318,19 @@ func TestEnforceErrorMessage(t *testing.T) {
 	iat := time.Unix(int64(1593035962), 0).Format(time.RFC3339)
 	exp := fmt.Sprintf("rpc error: code = PermissionDenied desc = permission denied: project, sub: proj:default:admin, iat: %s", iat)
 	// nolint:staticcheck
-	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{Subject: "proj:default:admin", IssuedAt: 1593035962})
+	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{Subject: "proj:default:admin", IssuedAt: jwt.NewTime(1593035962)})
 	err = enf.EnforceErr(ctx.Value("claims"), "project")
 	assert.Error(t, err)
 	assert.Equal(t, exp, err.Error())
 
 	// nolint:staticcheck
-	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{ExpiresAt: 1})
+	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{ExpiresAt: jwt.NewTime(1)})
 	err = enf.EnforceErr(ctx.Value("claims"), "project")
 	assert.Error(t, err)
 	assert.Equal(t, "rpc error: code = PermissionDenied desc = permission denied: project", err.Error())
 
 	// nolint:staticcheck
-	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{Subject: "proj:default:admin", IssuedAt: 0})
+	ctx = context.WithValue(context.Background(), "claims", &jwt.StandardClaims{Subject: "proj:default:admin", IssuedAt: nil})
 	err = enf.EnforceErr(ctx.Value("claims"), "project")
 	assert.Error(t, err)
 	assert.Equal(t, "rpc error: code = PermissionDenied desc = permission denied: project, sub: proj:default:admin", err.Error())

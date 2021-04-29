@@ -2,7 +2,7 @@
 
 Argo CD is largely stateless, all data is persisted as Kubernetes objects, which in turn is stored in Kubernetes' etcd. Redis is only used as a throw-away cache and can be lost. When lost, it will be rebuilt without loss of service.
 
-A set HA of manifests are provided for users who wish to run Argo CD in a highly available manner. This runs more containers, and run Redis in HA mode.
+A set of HA manifests are provided for users who wish to run Argo CD in a highly available manner. This runs more containers, and runs Redis in HA mode.
 
 [Manifests ⧉](https://github.com/argoproj/argo-cd/tree/master/manifests) 
 
@@ -31,6 +31,8 @@ or repositories has a lot of files. To avoid this problem mount persistent volum
 and might fail. To avoid failed syncs use `ARGOCD_GIT_ATTEMPTS_COUNT` environment variable to retry failed requests.
 
 * `argocd-repo-server` Every 3m (by default) Argo CD checks for changes to the app manifests. Argo CD assumes by default that manifests only change when the repo changes, so it caches generated manifests (for 24h by default). With Kustomize remote bases, or Helm patch releases, the manifests can change even though the repo has not changed. By reducing the cache time, you can get the changes without waiting for 24h. Use `--repo-cache-expiration duration`, and we'd suggest in low volume environments you try '1h'. Bear in mind this will negate the benefit of caching if set too low. 
+
+* `argocd-repo-server` fork exec config management tools such as `helm` or `kustomize` and enforces 90 seconds timeout. The timeout can be increased using `ARGOCD_EXEC_TIMEOUT` env variable.
 
 **metrics:**
 
@@ -125,7 +127,7 @@ If the manifest generation has no side effects then requests are processed in pa
 ### Webhook and Manifest Paths Annotation
 
 Argo CD aggressively caches generated manifests and uses repository commit SHA as a cache key. A new commit to the Git repository invalidates cache for all applications configured in the repository
-that again negatively affect mono repositories with multiple applications. You might use [webhooks ⧉](https://github.com/argoproj/argo-cd/tree/master/docs/operator-manual/webhook) and `argocd.argoproj.io/manifest-generate-paths` Application
+that again negatively affect mono repositories with multiple applications. You might use [webhooks ⧉](https://github.com/argoproj/argo-cd/blob/master/docs/operator-manual/webhook.md) and `argocd.argoproj.io/manifest-generate-paths` Application
 CRD annotation to solve this problem and improve performance.
 
 The `argocd.argoproj.io/manifest-generate-paths` contains a semicolon-separated list of paths within the Git repository that are used during manifest generation. The webhook compares paths specified in the annotation

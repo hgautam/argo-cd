@@ -1,10 +1,10 @@
-ARG BASE_IMAGE=debian:10-slim
+ARG BASE_IMAGE=docker.io/library/ubuntu:20.10
 ####################################################################################################
 # Builder image
 # Initial stage which pulls prepares build dependencies and CLI tooling we need for our final image
 # Also used as the image in CI jobs so needs all dependencies
 ####################################################################################################
-FROM golang:1.14.12 as builder
+FROM docker.io/library/golang:1.16.2 as builder
 
 RUN echo 'deb http://deb.debian.org/debian buster-backports main' >> /etc/apt/sources.list
 
@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     make \
     wget \
     gcc \
+    sudo \
     zip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
@@ -28,7 +29,6 @@ ADD hack/installers installers
 ADD hack/tool-versions.sh .
 
 RUN ./install.sh packr-linux
-RUN ./install.sh kubectl-linux
 RUN ./install.sh ksonnet-linux
 RUN ./install.sh helm2-linux
 RUN ./install.sh helm-linux
@@ -41,7 +41,7 @@ FROM $BASE_IMAGE as argocd-base
 
 USER root
 
-RUN echo 'deb http://deb.debian.org/debian buster-backports main' >> /etc/apt/sources.list
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN groupadd -g 999 argocd && \
     useradd -r -u 999 -g argocd argocd && \
@@ -50,6 +50,7 @@ RUN groupadd -g 999 argocd && \
     chmod g=u /home/argocd && \
     chmod g=u /etc/passwd && \
     apt-get update && \
+    apt-get dist-upgrade -y && \
     apt-get install -y git git-lfs python3-pip tini gpg && \
     apt-get clean && \
     pip3 install awscli==1.18.80 && \
@@ -61,7 +62,6 @@ COPY hack/git-verify-wrapper.sh /usr/local/bin/git-verify-wrapper.sh
 COPY --from=builder /usr/local/bin/ks /usr/local/bin/ks
 COPY --from=builder /usr/local/bin/helm2 /usr/local/bin/helm2
 COPY --from=builder /usr/local/bin/helm /usr/local/bin/helm
-COPY --from=builder /usr/local/bin/kubectl /usr/local/bin/kubectl
 COPY --from=builder /usr/local/bin/kustomize /usr/local/bin/kustomize
 # script to add current (possibly arbitrary) user to /etc/passwd at runtime
 # (if it's not already there, to be openshift friendly)
@@ -87,7 +87,7 @@ WORKDIR /home/argocd
 ####################################################################################################
 # Argo CD UI stage
 ####################################################################################################
-FROM node:12.18.4 as argocd-ui
+FROM docker.io/library/node:12.18.4 as argocd-ui
 
 WORKDIR /src
 ADD ["ui/package.json", "ui/yarn.lock", "./"]
@@ -98,12 +98,12 @@ ADD ["ui/", "."]
 
 ARG ARGO_VERSION=latest
 ENV ARGO_VERSION=$ARGO_VERSION
-RUN NODE_ENV='production' yarn build
+RUN NODE_ENV='production' NODE_ONLINE_ENV='online' yarn build
 
 ####################################################################################################
 # Argo CD Build stage which performs the actual build of Argo CD binaries
 ####################################################################################################
-FROM golang:1.14.12 as argocd-build
+FROM golang:1.16.0 as argocd-build
 
 COPY --from=builder /usr/local/bin/packr /usr/local/bin/packr
 
@@ -116,12 +116,12 @@ RUN go mod download
 
 # Perform the build
 COPY . .
-RUN make cli-local server controller repo-server argocd-util
+RUN make argocd-all
 
 ARG BUILD_ALL_CLIS=true
 RUN if [ "$BUILD_ALL_CLIS" = "true" ] ; then \
-    make CLI_NAME=argocd-darwin-amd64 GOOS=darwin cli-local && \
-    make CLI_NAME=argocd-windows-amd64.exe GOOS=windows cli-local \
+    make BIN_NAME=argocd-darwin-amd64 GOOS=darwin argocd-all && \
+    make BIN_NAME=argocd-windows-amd64.exe GOOS=windows argocd-all \
     ; fi
 
 ####################################################################################################
@@ -130,3 +130,12 @@ RUN if [ "$BUILD_ALL_CLIS" = "true" ] ; then \
 FROM argocd-base
 COPY --from=argocd-build /go/src/github.com/argoproj/argo-cd/dist/argocd* /usr/local/bin/
 COPY --from=argocd-ui ./src/dist/app /shared/app
+
+USER root
+RUN ln -s /usr/local/bin/argocd /usr/local/bin/argocd-util
+RUN ln -s /usr/local/bin/argocd /usr/local/bin/argocd-server
+RUN ln -s /usr/local/bin/argocd /usr/local/bin/argocd-repo-server
+RUN ln -s /usr/local/bin/argocd /usr/local/bin/argocd-application-controller
+RUN ln -s /usr/local/bin/argocd /usr/local/bin/argocd-dex
+
+USER 999

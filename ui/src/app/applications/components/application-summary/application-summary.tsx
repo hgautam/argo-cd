@@ -1,13 +1,14 @@
 import {AutocompleteField, DropDownMenu, FormField, FormSelect, HelpIcon, PopupApi} from 'argo-ui';
 import * as React from 'react';
 import {FormApi, Text} from 'react-form';
-import {Cluster, DataLoader, EditablePanel, EditablePanelItem, Expandable, MapInputField, Repo, Revision, RevisionHelpIcon} from '../../../shared/components';
+import {Cluster, DataLoader, EditablePanel, EditablePanelItem, Expandable, MapInputField, NumberField, Repo, Revision, RevisionHelpIcon} from '../../../shared/components';
 import {BadgePanel, Spinner} from '../../../shared/components';
 import {Consumer} from '../../../shared/context';
 import * as models from '../../../shared/models';
 import {services} from '../../../shared/services';
 
-import {ApplicationSyncOptionsField} from '../application-sync-options';
+import * as moment from 'moment';
+import {ApplicationSyncOptionsField} from '../application-sync-options/application-sync-options';
 import {RevisionFormField} from '../revision-form-field/revision-form-field';
 import {ComparisonStatusIcon, HealthStatusIcon, syncStatusMessage} from '../utils';
 
@@ -128,6 +129,13 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
             edit: (formApi: FormApi) => <FormField formApi={formApi} field='spec.destination.namespace' component={Text} />
         },
         {
+            title: 'CREATED_AT',
+            view: moment
+                .utc(app.metadata.creationTimestamp)
+                .local()
+                .format('MM/DD/YYYY HH:mm:ss')
+        },
+        {
             title: 'REPO URL',
             view: <Repo url={app.spec.source.repoURL} />,
             edit: (formApi: FormApi) => <FormField formApi={formApi} field='spec.source.repoURL' component={Text} />
@@ -202,10 +210,10 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
             view: app.spec.revisionHistoryLimit,
             edit: (formApi: FormApi) => (
                 <div style={{position: 'relative'}}>
-                    <FormField formApi={formApi} field='spec.revisionHistoryLimit' component={Text} />
+                    <FormField formApi={formApi} field='spec.revisionHistoryLimit' componentProps={{style: {paddingRight: '1em'}, placeholder: '10'}} component={NumberField} />
                     <div style={{position: 'absolute', right: '0', top: '0'}}>
                         <HelpIcon
-                            title='This limits this number of items kept in the apps revision history.
+                            title='This limits the number of items kept in the apps revision history.
     This should only be changed in exceptional circumstances.
     Setting to zero will store no history. This will reduce storage used.
     Increasing will increase the space used to store the history, so we do not recommend increasing it.
@@ -217,7 +225,21 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
         },
         {
             title: 'SYNC OPTIONS',
-            view: ((app.spec.syncPolicy || {}).syncOptions || []).join(', '),
+            view: (
+                <div style={{display: 'flex'}}>
+                    {((app.spec.syncPolicy || {}).syncOptions || []).map(opt =>
+                        opt.endsWith('=true') || opt.endsWith('=false') ? (
+                            <div key={opt} style={{marginRight: '10px'}}>
+                                <i className={`fa fa-${opt.includes('=true') ? 'check-square' : 'times'}`} /> {opt.replace('=true', '').replace('=false', '')}
+                            </div>
+                        ) : (
+                            <div key={opt} style={{marginRight: '10px'}}>
+                                {opt}
+                            </div>
+                        )
+                    )}
+                </div>
+            ),
             edit: (formApi: FormApi) => (
                 <div>
                     <FormField formApi={formApi} field='spec.syncPolicy.syncOptions' component={ApplicationSyncOptionsField} />
@@ -396,9 +418,9 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
                 {ctx => (
                     <div className='white-box'>
                         <div className='white-box__details'>
-                            <p>Sync Policy</p>
+                            <p>SYNC POLICY</p>
                             <div className='row white-box__details-row'>
-                                <div className='columns small-3'>{(app.spec.syncPolicy && app.spec.syncPolicy.automated && <span>Automated</span>) || <span>None</span>}</div>
+                                <div className='columns small-3'>{(app.spec.syncPolicy && app.spec.syncPolicy.automated && <span>AUTOMATED</span>) || <span>NONE</span>}</div>
                                 <div className='columns small-9'>
                                     {(app.spec.syncPolicy && app.spec.syncPolicy.automated && (
                                         <button className='argo-button argo-button--base' onClick={() => unsetAutoSync(ctx)}>
@@ -421,7 +443,7 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
                             {app.spec.syncPolicy && app.spec.syncPolicy.automated && (
                                 <React.Fragment>
                                     <div className='row white-box__details-row'>
-                                        <div className='columns small-3'>Prune Resources</div>
+                                        <div className='columns small-3'>PRUNE RESOURCES</div>
                                         <div className='columns small-9'>
                                             {(app.spec.syncPolicy.automated.prune && (
                                                 <button
@@ -455,7 +477,7 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
                                         </div>
                                     </div>
                                     <div className='row white-box__details-row'>
-                                        <div className='columns small-3'>Self Heal</div>
+                                        <div className='columns small-3'>SELF HEAL</div>
                                         <div className='columns small-9'>
                                             {(app.spec.syncPolicy.automated.selfHeal && (
                                                 <button
@@ -495,7 +517,7 @@ export const ApplicationSummary = (props: {app: models.Application; updateApp: (
                 )}
             </Consumer>
             <BadgePanel app={props.app.metadata.name} />
-            <EditablePanel save={props.updateApp} values={app} title='Info' items={infoItems} onModeSwitch={() => setAdjustedCount(0)} />
+            <EditablePanel save={props.updateApp} values={app} title='INFO' items={infoItems} onModeSwitch={() => setAdjustedCount(0)} />
         </div>
     );
 };

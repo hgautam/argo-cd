@@ -8,8 +8,8 @@ metadata:
   name: argocd-server
 spec:
   selector:
-   matchLabels:
-    app.kubernetes.io/name: argocd-server
+    matchLabels:
+      app.kubernetes.io/name: argocd-server
   template:
     metadata:
       labels:
@@ -18,7 +18,7 @@ spec:
       serviceAccountName: argocd-server
       containers:
       - name: argocd-server
-        image: argoproj/argocd:latest
+        image: quay.io/argoproj/argocd:latest
         imagePullPolicy: Always
         command: [argocd-server, --staticassets, /shared/app]
         volumeMounts:
@@ -26,16 +26,39 @@ spec:
           mountPath: /app/config/ssh
         - name: tls-certs
           mountPath: /app/config/tls
+        - name: argocd-repo-server-tls
+          mountPath: /app/config/server/tls
+        - mountPath: /home/argocd
+          name: plugins-home
+        - mountPath: /tmp
+          name: tmp
         ports:
         - containerPort: 8080
         - containerPort: 8083
+        livenessProbe:
+          httpGet:
+            path: /healthz?full=true
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /healthz
             port: 8080
           initialDelaySeconds: 3
           periodSeconds: 30
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          capabilities:
+            drop:
+              - all
       volumes:
+      - emptyDir: {}
+        name: plugins-home
+      - emptyDir: {}
+        name: tmp
       - emptyDir: {}
         name: static-files
       - name: ssh-known-hosts
@@ -44,6 +67,17 @@ spec:
       - name: tls-certs
         configMap:
           name: argocd-tls-certs-cm
+      - name: argocd-repo-server-tls
+        secret:
+          secretName: argocd-repo-server-tls
+          optional: true
+          items:
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          - key: ca.crt
+            path: ca.crt
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

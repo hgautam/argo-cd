@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/argoproj/gitops-engine/pkg/diff"
@@ -12,6 +13,7 @@ import (
 	hookutil "github.com/argoproj/gitops-engine/pkg/sync/hook"
 	"github.com/argoproj/gitops-engine/pkg/sync/ignore"
 	resourceutil "github.com/argoproj/gitops-engine/pkg/sync/resource"
+	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	kubeutil "github.com/argoproj/gitops-engine/pkg/utils/kube"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,20 +22,21 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/argoproj/argo-cd/common"
-	statecache "github.com/argoproj/argo-cd/controller/cache"
-	"github.com/argoproj/argo-cd/controller/metrics"
-	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	appclientset "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
-	"github.com/argoproj/argo-cd/reposerver/apiclient"
-	"github.com/argoproj/argo-cd/util/argo"
-	"github.com/argoproj/argo-cd/util/db"
-	"github.com/argoproj/argo-cd/util/gpg"
-	argohealth "github.com/argoproj/argo-cd/util/health"
-	"github.com/argoproj/argo-cd/util/io"
-	"github.com/argoproj/argo-cd/util/settings"
-	"github.com/argoproj/argo-cd/util/stats"
+	"github.com/argoproj/argo-cd/v2/common"
+	statecache "github.com/argoproj/argo-cd/v2/controller/cache"
+	"github.com/argoproj/argo-cd/v2/controller/metrics"
+	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	appv1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	appclientset "github.com/argoproj/argo-cd/v2/pkg/client/clientset/versioned"
+	"github.com/argoproj/argo-cd/v2/reposerver/apiclient"
+	"github.com/argoproj/argo-cd/v2/util/argo"
+	appstatecache "github.com/argoproj/argo-cd/v2/util/cache/appstate"
+	"github.com/argoproj/argo-cd/v2/util/db"
+	"github.com/argoproj/argo-cd/v2/util/gpg"
+	argohealth "github.com/argoproj/argo-cd/v2/util/health"
+	"github.com/argoproj/argo-cd/v2/util/io"
+	"github.com/argoproj/argo-cd/v2/util/settings"
+	"github.com/argoproj/argo-cd/v2/util/stats"
 )
 
 type resourceInfoProviderStub struct {
@@ -44,15 +47,16 @@ func (r *resourceInfoProviderStub) IsNamespaced(_ schema.GroupKind) (bool, error
 }
 
 type managedResource struct {
-	Target    *unstructured.Unstructured
-	Live      *unstructured.Unstructured
-	Diff      diff.DiffResult
-	Group     string
-	Version   string
-	Kind      string
-	Namespace string
-	Name      string
-	Hook      bool
+	Target          *unstructured.Unstructured
+	Live            *unstructured.Unstructured
+	Diff            diff.DiffResult
+	Group           string
+	Version         string
+	Kind            string
+	Namespace       string
+	Name            string
+	Hook            bool
+	ResourceVersion string
 }
 
 func GetLiveObjsForApplicationHealth(resources []managedResource, statuses []appv1.ResourceStatus) ([]*appv1.ResourceStatus, []*unstructured.Unstructured) {
@@ -84,7 +88,8 @@ type comparisonResult struct {
 	diffNormalizer       diff.Normalizer
 	appSourceType        v1alpha1.ApplicationSourceType
 	// timings maps phases of comparison to the duration it took to complete (for statistical purposes)
-	timings map[string]time.Duration
+	timings        map[string]time.Duration
+	diffResultList *diff.DiffResultList
 }
 
 func (res *comparisonResult) GetSyncStatus() *v1alpha1.SyncStatus {
@@ -97,20 +102,26 @@ func (res *comparisonResult) GetHealthStatus() *v1alpha1.HealthStatus {
 
 // appStateManager allows to compare applications to git
 type appStateManager struct {
-	metricsServer  *metrics.MetricsServer
-	db             db.ArgoDB
-	settingsMgr    *settings.SettingsManager
-	appclientset   appclientset.Interface
-	projInformer   cache.SharedIndexInformer
-	kubectl        kubeutil.Kubectl
-	repoClientset  apiclient.Clientset
-	liveStateCache statecache.LiveStateCache
-	namespace      string
+	metricsServer        *metrics.MetricsServer
+	db                   db.ArgoDB
+	settingsMgr          *settings.SettingsManager
+	appclientset         appclientset.Interface
+	projInformer         cache.SharedIndexInformer
+	kubectl              kubeutil.Kubectl
+	repoClientset        apiclient.Clientset
+	liveStateCache       statecache.LiveStateCache
+	cache                *appstatecache.Cache
+	namespace            string
+	statusRefreshTimeout time.Duration
 }
 
-func (m *appStateManager) getRepoObjs(app *v1alpha1.Application, source v1alpha1.ApplicationSource, appLabelKey, revision string, noCache, verifySignature bool) ([]*unstructured.Unstructured, *apiclient.ManifestResponse, error) {
+func (m *appStateManager) getRepoObjs(app *v1alpha1.Application, source v1alpha1.ApplicationSource, appLabelKey, revision string, noCache, verifySignature bool, proj *v1alpha1.AppProject) ([]*unstructured.Unstructured, *apiclient.ManifestResponse, error) {
 	ts := stats.NewTimingStats()
 	helmRepos, err := m.db.ListHelmRepositories(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+	permittedHelmRepos, err := argo.GetPermittedRepos(proj, helmRepos)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -120,6 +131,14 @@ func (m *appStateManager) getRepoObjs(app *v1alpha1.Application, source v1alpha1
 		return nil, nil, err
 	}
 	ts.AddCheckpoint("repo_ms")
+	helmRepositoryCredentials, err := m.db.GetAllHelmRepositoryCredentials(context.Background())
+	if err != nil {
+		return nil, nil, err
+	}
+	permittedHelmCredentials, err := argo.GetPermittedReposCredentials(proj, helmRepositoryCredentials)
+	if err != nil {
+		return nil, nil, err
+	}
 	conn, repoClient, err := m.repoClientset.NewRepoServerClient()
 	if err != nil {
 		return nil, nil, err
@@ -156,11 +175,11 @@ func (m *appStateManager) getRepoObjs(app *v1alpha1.Application, source v1alpha1
 	ts.AddCheckpoint("version_ms")
 	manifestInfo, err := repoClient.GenerateManifest(context.Background(), &apiclient.ManifestRequest{
 		Repo:              repo,
-		Repos:             helmRepos,
+		Repos:             permittedHelmRepos,
 		Revision:          revision,
 		NoCache:           noCache,
 		AppLabelKey:       appLabelKey,
-		AppLabelValue:     app.Name,
+		AppName:           app.Name,
 		Namespace:         app.Spec.Destination.Namespace,
 		ApplicationSource: &source,
 		Plugins:           tools,
@@ -168,6 +187,7 @@ func (m *appStateManager) getRepoObjs(app *v1alpha1.Application, source v1alpha1
 		KubeVersion:       serverVersion,
 		ApiVersions:       argo.APIGroupsToVersions(apiGroups),
 		VerifySignature:   verifySignature,
+		HelmRepoCreds:     permittedHelmCredentials,
 	})
 	if err != nil {
 		return nil, nil, err
@@ -268,34 +288,29 @@ func verifyGnuPGSignature(revision string, project *appv1.AppProject, manifestIn
 	conditions := make([]appv1.ApplicationCondition, 0)
 	// We need to have some data in the verification result to parse, otherwise there was no signature
 	if manifestInfo.VerifyResult != "" {
-		verifyResult, err := gpg.ParseGitCommitVerification(manifestInfo.VerifyResult)
-		if err != nil {
-			conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: err.Error(), LastTransitionTime: &now})
-			log.Errorf("Error while verifying git commit for revision %s: %s", revision, err.Error())
-		} else {
-			switch verifyResult.Result {
-			case gpg.VerifyResultGood:
-				// This is the only case we allow to sync to, but we need to make sure signing key is allowed
-				validKey := false
-				for _, k := range project.Spec.SignatureKeys {
-					if gpg.KeyID(k.KeyID) == gpg.KeyID(verifyResult.KeyID) && gpg.KeyID(k.KeyID) != "" {
-						validKey = true
-						break
-					}
+		verifyResult := gpg.ParseGitCommitVerification(manifestInfo.VerifyResult)
+		switch verifyResult.Result {
+		case gpg.VerifyResultGood:
+			// This is the only case we allow to sync to, but we need to make sure signing key is allowed
+			validKey := false
+			for _, k := range project.Spec.SignatureKeys {
+				if gpg.KeyID(k.KeyID) == gpg.KeyID(verifyResult.KeyID) && gpg.KeyID(k.KeyID) != "" {
+					validKey = true
+					break
 				}
-				if !validKey {
-					msg := fmt.Sprintf("Found good signature made with %s key %s, but this key is not allowed in AppProject",
-						verifyResult.Cipher, verifyResult.KeyID)
-					conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})
-				}
-			case gpg.VerifyResultInvalid:
-				msg := fmt.Sprintf("Found signature made with %s key %s, but verification result was invalid: '%s'",
-					verifyResult.Cipher, verifyResult.KeyID, verifyResult.Message)
-				conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})
-			default:
-				msg := fmt.Sprintf("Could not verify commit signature on revision '%s', check logs for more information.", revision)
+			}
+			if !validKey {
+				msg := fmt.Sprintf("Found good signature made with %s key %s, but this key is not allowed in AppProject",
+					verifyResult.Cipher, verifyResult.KeyID)
 				conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})
 			}
+		case gpg.VerifyResultInvalid:
+			msg := fmt.Sprintf("Found signature made with %s key %s, but verification result was invalid: '%s'",
+				verifyResult.Cipher, verifyResult.KeyID, verifyResult.Message)
+			conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})
+		default:
+			msg := fmt.Sprintf("Could not verify commit signature on revision '%s', check logs for more information.", revision)
+			conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: msg, LastTransitionTime: &now})
 		}
 	} else {
 		msg := fmt.Sprintf("Target revision %s in Git is not signed, but a signature is required", revision)
@@ -303,6 +318,58 @@ func verifyGnuPGSignature(revision string, project *appv1.AppProject, manifestIn
 	}
 
 	return conditions
+}
+
+func (m *appStateManager) diffArrayCached(configArray []*unstructured.Unstructured, liveArray []*unstructured.Unstructured, cachedDiff []*appv1.ResourceDiff, opts ...diff.Option) (*diff.DiffResultList, error) {
+	numItems := len(configArray)
+	if len(liveArray) != numItems {
+		return nil, fmt.Errorf("left and right arrays have mismatched lengths")
+	}
+
+	diffByKey := map[kube.ResourceKey]*appv1.ResourceDiff{}
+	for i := range cachedDiff {
+		res := cachedDiff[i]
+		diffByKey[kube.NewResourceKey(res.Group, res.Kind, res.Namespace, res.Name)] = cachedDiff[i]
+	}
+
+	diffResultList := diff.DiffResultList{
+		Diffs: make([]diff.DiffResult, numItems),
+	}
+
+	for i := 0; i < numItems; i++ {
+		config := configArray[i]
+		live := liveArray[i]
+		resourceVersion := ""
+		var key kube.ResourceKey
+		if live != nil {
+			key = kube.GetResourceKey(live)
+			resourceVersion = live.GetResourceVersion()
+		} else {
+			key = kube.GetResourceKey(config)
+		}
+		var dr *diff.DiffResult
+		if cachedDiff, ok := diffByKey[key]; ok && cachedDiff.ResourceVersion == resourceVersion {
+			dr = &diff.DiffResult{
+				NormalizedLive: []byte(cachedDiff.NormalizedLiveState),
+				PredictedLive:  []byte(cachedDiff.PredictedLiveState),
+				Modified:       cachedDiff.Modified,
+			}
+		} else {
+			res, err := diff.Diff(configArray[i], liveArray[i], opts...)
+			if err != nil {
+				return nil, err
+			}
+			dr = res
+		}
+		if dr != nil {
+			diffResultList.Diffs[i] = *dr
+			if dr.Modified {
+				diffResultList.Modified = true
+			}
+		}
+	}
+
+	return &diffResultList, nil
 }
 
 // CompareAppState compares application git state to the live app state, using the specified
@@ -342,7 +409,7 @@ func (m *appStateManager) CompareAppState(app *v1alpha1.Application, project *ap
 	now := metav1.Now()
 
 	if len(localManifests) == 0 {
-		targetObjs, manifestInfo, err = m.getRepoObjs(app, source, appLabelKey, revision, noCache, verifySignature)
+		targetObjs, manifestInfo, err = m.getRepoObjs(app, source, appLabelKey, revision, noCache, verifySignature, project)
 		if err != nil {
 			targetObjs = make([]*unstructured.Unstructured, 0)
 			conditions = append(conditions, v1alpha1.ApplicationCondition{Type: v1alpha1.ApplicationConditionComparisonError, Message: err.Error(), LastTransitionTime: &now})
@@ -430,11 +497,27 @@ func (m *appStateManager) CompareAppState(app *v1alpha1.Application, project *ap
 	}
 
 	logCtx.Debugf("built managed objects list")
-	// Do the actual comparison
-	diffResults, err := diff.DiffArray(
-		reconciliation.Target, reconciliation.Live,
+	var diffResults *diff.DiffResultList
+
+	diffOpts := []diff.Option{
 		diff.WithNormalizer(diffNormalizer),
-		diff.IgnoreAggregatedRoles(compareOptions.IgnoreAggregatedRoles))
+		diff.IgnoreAggregatedRoles(compareOptions.IgnoreAggregatedRoles),
+	}
+	cachedDiff := make([]*appv1.ResourceDiff, 0)
+	// restore comparison using cached diff result if previous comparison was performed for the same revision
+	revisionChanged := manifestInfo == nil || app.Status.Sync.Revision != manifestInfo.Revision
+	specChanged := !reflect.DeepEqual(app.Status.Sync.ComparedTo, appv1.ComparedTo{Source: app.Spec.Source, Destination: app.Spec.Destination})
+
+	_, refreshRequested := app.IsRefreshRequested()
+	noCache = noCache || refreshRequested || app.Status.Expired(m.statusRefreshTimeout)
+
+	if noCache || specChanged || revisionChanged || m.cache.GetAppManagedResources(app.Name, &cachedDiff) != nil {
+		// (rare) cache miss
+		diffResults, err = diff.DiffArray(reconciliation.Target, reconciliation.Live, diffOpts...)
+	} else {
+		diffResults, err = m.diffArrayCached(reconciliation.Target, reconciliation.Live, cachedDiff, diffOpts...)
+	}
+
 	if err != nil {
 		diffResults = &diff.DiffResultList{}
 		failedToLoadObjs = true
@@ -502,16 +585,22 @@ func (m *appStateManager) CompareAppState(app *v1alpha1.Application, project *ap
 		if failedToLoadObjs {
 			resState.Status = v1alpha1.SyncStatusCodeUnknown
 		}
+
+		resourceVersion := ""
+		if liveObj != nil {
+			resourceVersion = liveObj.GetResourceVersion()
+		}
 		managedResources[i] = managedResource{
-			Name:      resState.Name,
-			Namespace: resState.Namespace,
-			Group:     resState.Group,
-			Kind:      resState.Kind,
-			Version:   resState.Version,
-			Live:      liveObj,
-			Target:    targetObj,
-			Diff:      diffResult,
-			Hook:      resState.Hook,
+			Name:            resState.Name,
+			Namespace:       resState.Namespace,
+			Group:           resState.Group,
+			Kind:            resState.Kind,
+			Version:         resState.Version,
+			Live:            liveObj,
+			Target:          targetObj,
+			Diff:            diffResult,
+			Hook:            resState.Hook,
+			ResourceVersion: resourceVersion,
 		}
 		resourceSummaries[i] = resState
 	}
@@ -554,6 +643,7 @@ func (m *appStateManager) CompareAppState(app *v1alpha1.Application, project *ap
 		managedResources:     managedResources,
 		reconciliationResult: reconciliation,
 		diffNormalizer:       diffNormalizer,
+		diffResultList:       diffResults,
 	}
 	if manifestInfo != nil {
 		compRes.appSourceType = v1alpha1.ApplicationSourceType(manifestInfo.SourceType)
@@ -607,16 +697,20 @@ func NewAppStateManager(
 	liveStateCache statecache.LiveStateCache,
 	projInformer cache.SharedIndexInformer,
 	metricsServer *metrics.MetricsServer,
+	cache *appstatecache.Cache,
+	statusRefreshTimeout time.Duration,
 ) AppStateManager {
 	return &appStateManager{
-		liveStateCache: liveStateCache,
-		db:             db,
-		appclientset:   appclientset,
-		kubectl:        kubectl,
-		repoClientset:  repoClientset,
-		namespace:      namespace,
-		settingsMgr:    settingsMgr,
-		projInformer:   projInformer,
-		metricsServer:  metricsServer,
+		liveStateCache:       liveStateCache,
+		cache:                cache,
+		db:                   db,
+		appclientset:         appclientset,
+		kubectl:              kubectl,
+		repoClientset:        repoClientset,
+		namespace:            namespace,
+		settingsMgr:          settingsMgr,
+		projInformer:         projInformer,
+		metricsServer:        metricsServer,
+		statusRefreshTimeout: statusRefreshTimeout,
 	}
 }

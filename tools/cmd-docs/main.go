@@ -4,13 +4,14 @@ import (
 	"log"
 	"os"
 
-	controller "github.com/argoproj/argo-cd/cmd/argocd-application-controller/commands"
-	reposerver "github.com/argoproj/argo-cd/cmd/argocd-repo-server/commands"
-	argocdserver "github.com/argoproj/argo-cd/cmd/argocd-server/commands"
-	argocdutil "github.com/argoproj/argo-cd/cmd/argocd-util/commands"
-	argocdcli "github.com/argoproj/argo-cd/cmd/argocd/commands"
-
 	"github.com/spf13/cobra/doc"
+
+	controller "github.com/argoproj/argo-cd/v2/cmd/argocd-application-controller/commands"
+	argocddex "github.com/argoproj/argo-cd/v2/cmd/argocd-dex/commands"
+	reposerver "github.com/argoproj/argo-cd/v2/cmd/argocd-repo-server/commands"
+	argocdserver "github.com/argoproj/argo-cd/v2/cmd/argocd-server/commands"
+	argocdutil "github.com/argoproj/argo-cd/v2/cmd/argocd-util/commands"
+	argocdcli "github.com/argoproj/argo-cd/v2/cmd/argocd/commands"
 )
 
 func main() {
@@ -33,6 +34,11 @@ func main() {
 	}
 
 	err = doc.GenMarkdownTree(reposerver.NewCommand(), "./docs/operator-manual/server-commands")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = doc.GenMarkdownTree(argocddex.NewCommand(), "./docs/operator-manual/server-commands")
 	if err != nil {
 		log.Fatal(err)
 	}

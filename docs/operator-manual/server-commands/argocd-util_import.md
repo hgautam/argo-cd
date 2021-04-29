@@ -2,10 +2,6 @@
 
 Import Argo CD data from stdin (specify `-') or a file
 
-### Synopsis
-
-Import Argo CD data from stdin (specify `-') or a file
-
 ```
 argocd-util import SOURCE [flags]
 ```
@@ -33,6 +29,7 @@ argocd-util import SOURCE [flags]
       --token string                   Bearer token for authentication to the API server
       --user string                    The name of the kubeconfig user to use
       --username string                Username for basic authentication to the API server
+      --verbose                        Verbose output (versus only changed output)
 ```
 
 ### SEE ALSO

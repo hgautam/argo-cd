@@ -1,12 +1,10 @@
 package commands
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -16,63 +14,24 @@ import (
 	"github.com/ghodss/yaml"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
 
-	argocdclient "github.com/argoproj/argo-cd/pkg/apiclient"
-	projectpkg "github.com/argoproj/argo-cd/pkg/apiclient/project"
-	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	"github.com/argoproj/argo-cd/util/cli"
-	"github.com/argoproj/argo-cd/util/config"
-	"github.com/argoproj/argo-cd/util/errors"
-	"github.com/argoproj/argo-cd/util/git"
-	"github.com/argoproj/argo-cd/util/gpg"
-	argoio "github.com/argoproj/argo-cd/util/io"
+	cmdutil "github.com/argoproj/argo-cd/v2/cmd/util"
+	argocdclient "github.com/argoproj/argo-cd/v2/pkg/apiclient"
+	projectpkg "github.com/argoproj/argo-cd/v2/pkg/apiclient/project"
+	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/v2/util/cli"
+	"github.com/argoproj/argo-cd/v2/util/errors"
+	"github.com/argoproj/argo-cd/v2/util/git"
+	"github.com/argoproj/argo-cd/v2/util/gpg"
+	argoio "github.com/argoproj/argo-cd/v2/util/io"
 )
-
-type projectOpts struct {
-	description              string
-	destinations             []string
-	sources                  []string
-	signatureKeys            []string
-	orphanedResourcesEnabled bool
-	orphanedResourcesWarn    bool
-}
 
 type policyOpts struct {
 	action     string
 	permission string
 	object     string
-}
-
-func (opts *projectOpts) GetDestinations() []v1alpha1.ApplicationDestination {
-	destinations := make([]v1alpha1.ApplicationDestination, 0)
-	for _, destStr := range opts.destinations {
-		parts := strings.Split(destStr, ",")
-		if len(parts) != 2 {
-			log.Fatalf("Expected destination of the form: server,namespace. Received: %s", destStr)
-		} else {
-			destinations = append(destinations, v1alpha1.ApplicationDestination{
-				Server:    parts[0],
-				Namespace: parts[1],
-			})
-		}
-	}
-	return destinations
-}
-
-// TODO: Get configured keys and emit warning when a key is specified that is not configured
-func (opts *projectOpts) GetSignatureKeys() []v1alpha1.SignatureKey {
-	signatureKeys := make([]v1alpha1.SignatureKey, 0)
-	for _, keyStr := range opts.signatureKeys {
-		if !gpg.IsShortKeyID(keyStr) && !gpg.IsLongKeyID(keyStr) {
-			log.Fatalf("'%s' is not a valid GnuPG key ID", keyStr)
-		}
-		signatureKeys = append(signatureKeys, v1alpha1.SignatureKey{KeyID: gpg.KeyID(keyStr)})
-	}
-	return signatureKeys
 }
 
 // NewProjectCommand returns a new instance of an `argocd proj` command
@@ -108,28 +67,6 @@ func NewProjectCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	return command
 }
 
-func addProjFlags(command *cobra.Command, opts *projectOpts) {
-	command.Flags().StringVarP(&opts.description, "description", "", "", "Project description")
-	command.Flags().StringArrayVarP(&opts.destinations, "dest", "d", []string{},
-		"Permitted destination server and namespace (e.g. https://192.168.99.100:8443,default)")
-	command.Flags().StringArrayVarP(&opts.sources, "src", "s", []string{}, "Permitted source repository URL")
-	command.Flags().StringSliceVar(&opts.signatureKeys, "signature-keys", []string{}, "GnuPG public key IDs for commit signature verification")
-	command.Flags().BoolVar(&opts.orphanedResourcesEnabled, "orphaned-resources", false, "Enables orphaned resources monitoring")
-	command.Flags().BoolVar(&opts.orphanedResourcesWarn, "orphaned-resources-warn", false, "Specifies if applications should be a warning condition when orphaned resources detected")
-}
-
-func getOrphanedResourcesSettings(c *cobra.Command, opts projectOpts) *v1alpha1.OrphanedResourcesMonitorSettings {
-	warnChanged := c.Flag("orphaned-resources-warn").Changed
-	if opts.orphanedResourcesEnabled || warnChanged {
-		settings := v1alpha1.OrphanedResourcesMonitorSettings{}
-		if warnChanged {
-			settings.Warn = pointer.BoolPtr(opts.orphanedResourcesWarn)
-		}
-		return &settings
-	}
-	return nil
-}
-
 func addPolicyFlags(command *cobra.Command, opts *policyOpts) {
 	command.Flags().StringVarP(&opts.action, "action", "a", "", "Action to grant/deny permission on (e.g. get, create, list, update, delete)")
 	command.Flags().StringVarP(&opts.permission, "permission", "p", "allow", "Whether to allow or deny access to object with the action.  This can only be 'allow' or 'deny'")
@@ -144,7 +81,7 @@ func humanizeTimestamp(epoch int64) string {
 // NewProjectCreateCommand returns a new instance of an `argocd proj create` command
 func NewProjectCreateCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		opts    projectOpts
+		opts    cmdutil.ProjectOpts
 		fileURL string
 		upsert  bool
 	)
@@ -152,48 +89,12 @@ func NewProjectCreateCommand(clientOpts *argocdclient.ClientOptions) *cobra.Comm
 		Use:   "create PROJECT",
 		Short: "Create a project",
 		Run: func(c *cobra.Command, args []string) {
-			var proj v1alpha1.AppProject
-			fmt.Printf("EE: %d/%v\n", len(opts.signatureKeys), opts.signatureKeys)
-			if fileURL == "-" {
-				// read stdin
-				reader := bufio.NewReader(os.Stdin)
-				err := config.UnmarshalReader(reader, &proj)
-				if err != nil {
-					log.Fatalf("unable to read manifest from stdin: %v", err)
-				}
-			} else if fileURL != "" {
-				// read uri
-				parsedURL, err := url.ParseRequestURI(fileURL)
-				if err != nil || !(parsedURL.Scheme == "http" || parsedURL.Scheme == "https") {
-					err = config.UnmarshalLocalFile(fileURL, &proj)
-				} else {
-					err = config.UnmarshalRemoteFile(fileURL, &proj)
-				}
-				errors.CheckError(err)
-				if len(args) == 1 && args[0] != proj.Name {
-					log.Fatalf("project name '%s' does not match project spec metadata.name '%s'", args[0], proj.Name)
-				}
-			} else {
-				// read arguments
-				if len(args) == 0 {
-					c.HelpFunc()(c, args)
-					os.Exit(1)
-				}
-				projName := args[0]
-				proj = v1alpha1.AppProject{
-					ObjectMeta: v1.ObjectMeta{Name: projName},
-					Spec: v1alpha1.AppProjectSpec{
-						Description:       opts.description,
-						Destinations:      opts.GetDestinations(),
-						SourceRepos:       opts.sources,
-						SignatureKeys:     opts.GetSignatureKeys(),
-						OrphanedResources: getOrphanedResourcesSettings(c, opts),
-					},
-				}
-			}
+			proj, err := cmdutil.ConstructAppProj(fileURL, args, opts, c)
+			errors.CheckError(err)
+
 			conn, projIf := argocdclient.NewClientOrDie(clientOpts).NewProjectClientOrDie()
 			defer argoio.Close(conn)
-			_, err := projIf.Create(context.Background(), &projectpkg.ProjectCreateRequest{Project: &proj, Upsert: upsert})
+			_, err = projIf.Create(context.Background(), &projectpkg.ProjectCreateRequest{Project: proj, Upsert: upsert})
 			errors.CheckError(err)
 		},
 	}
@@ -203,14 +104,14 @@ func NewProjectCreateCommand(clientOpts *argocdclient.ClientOptions) *cobra.Comm
 	if err != nil {
 		log.Fatal(err)
 	}
-	addProjFlags(command, &opts)
+	cmdutil.AddProjFlags(command, &opts)
 	return command
 }
 
 // NewProjectSetCommand returns a new instance of an `argocd proj set` command
 func NewProjectSetCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
 	var (
-		opts projectOpts
+		opts cmdutil.ProjectOpts
 	)
 	var command = &cobra.Command{
 		Use:   "set PROJECT",
@@ -227,23 +128,7 @@ func NewProjectSetCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command
 			proj, err := projIf.Get(context.Background(), &projectpkg.ProjectQuery{Name: projName})
 			errors.CheckError(err)
 
-			visited := 0
-			c.Flags().Visit(func(f *pflag.Flag) {
-				visited++
-				switch f.Name {
-				case "description":
-					proj.Spec.Description = opts.description
-				case "dest":
-					proj.Spec.Destinations = opts.GetDestinations()
-				case "src":
-					proj.Spec.SourceRepos = opts.sources
-				case "signature-keys":
-					proj.Spec.SignatureKeys = opts.GetSignatureKeys()
-				case "orphaned-resources", "orphaned-resources-warn":
-					proj.Spec.OrphanedResources = getOrphanedResourcesSettings(c, opts)
-				}
-			})
-			if visited == 0 {
+			if visited := cmdutil.SetProjSpecOptions(c.Flags(), &proj.Spec, &opts); visited == 0 {
 				log.Error("Please set at least one option to update")
 				c.HelpFunc()(c, args)
 				os.Exit(1)
@@ -253,7 +138,7 @@ func NewProjectSetCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command
 			errors.CheckError(err)
 		},
 	}
-	addProjFlags(command, &opts)
+	cmdutil.AddProjFlags(command, &opts)
 	return command
 }
 
